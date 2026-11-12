@@ -1,0 +1,76 @@
+From 41c3ab27dba8e37941c1ee92b92d26f060cedbbf Mon Sep 17 00:00:00 2001
+From: MrBoogus <90836807+MrBoogus@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:17:28 +0300
+Subject: [PATCH 2/2] LF: T55xx: add MCU-side ASK demodulation to
+ T55xxReadBlock
+
+When brute_mem is false, run askdemod() directly on the acquired raw
+samples in BigBuf. If a valid repeating 32-bit block is identified
+(matching adjacent repetitions at 32 or 33 bit intervals), return the
+decoded 32-bit uint32_t block directly in the CMD_LF_T55XX_READBL
+payload. This avoids requiring a large raw sample buffer download to the
+host when reading individual T55xx blocks over constrained serial/SPI
+links. If demodulation fails, the command succeeds with an empty payload
+as before, preserving full backward compatibility with client-side demod.
+---
+ armsrc/lfops.c | 43 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/armsrc/lfops.c b/armsrc/lfops.c
+index 5c14377c1..b019fca2b 100644
+--- a/armsrc/lfops.c
++++ b/armsrc/lfops.c
+@@ -2114,8 +2114,49 @@ void T55xxReadBlock(uint8_t page, bool pwd_mode, bool brute_mem, uint8_t block,
+ 
+     // Turn the field off
+     if (brute_mem == false) {
++        uint32_t decoded_block = 0;
++        bool has_decoded = false;
++        uint8_t *dest = BigBuf_get_addr();
++        size_t size = samples;
++        int clk = 0, invert = 0, maxErr = 20;
++        int errCnt = askdemod(dest, &size, &clk, &invert, maxErr, 0, 1);
++        if (errCnt <= 50 && size >= 32) {
++            for (size_t i = 0; i + 32 <= size; i++) {
++                uint32_t w = 0;
++                for (int b = 0; b < 32; b++) {
++                    w = (w << 1) | (dest[i + b] & 1);
++                }
++                if (i + 64 <= size) {
++                    uint32_t w2 = 0;
++                    for (int b = 0; b < 32; b++) {
++                        w2 = (w2 << 1) | (dest[i + 32 + b] & 1);
++                    }
++                    if (w == w2) {
++                        decoded_block = w;
++                        has_decoded = true;
++                        break;
++                    }
++                }
++                if (i + 65 <= size) {
++                    uint32_t w3 = 0;
++                    for (int b = 0; b < 32; b++) {
++                        w3 = (w3 << 1) | (dest[i + 33 + b] & 1);
++                    }
++                    if (w == w3) {
++                        decoded_block = w;
++                        has_decoded = true;
++                        break;
++                    }
++                }
++            }
++        }
++
+         FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+-        reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, NULL, 0);
++        if (has_decoded) {
++            reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, (uint8_t *)&decoded_block, sizeof(decoded_block));
++        } else {
++            reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, NULL, 0);
++        }
+         if (ledcontrol) LED_A_OFF();
+     }
+ 
+-- 
+2.56.0
+

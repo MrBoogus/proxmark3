@@ -2114,8 +2114,49 @@ void T55xxReadBlock(uint8_t page, bool pwd_mode, bool brute_mem, uint8_t block, 
 
     // Turn the field off
     if (brute_mem == false) {
+        uint32_t decoded_block = 0;
+        bool has_decoded = false;
+        uint8_t *dest = BigBuf_get_addr();
+        size_t size = samples;
+        int clk = 0, invert = 0, maxErr = 20;
+        int errCnt = askdemod(dest, &size, &clk, &invert, maxErr, 0, 1);
+        if (errCnt <= 50 && size >= 32) {
+            for (size_t i = 0; i + 32 <= size; i++) {
+                uint32_t w = 0;
+                for (int b = 0; b < 32; b++) {
+                    w = (w << 1) | (dest[i + b] & 1);
+                }
+                if (i + 64 <= size) {
+                    uint32_t w2 = 0;
+                    for (int b = 0; b < 32; b++) {
+                        w2 = (w2 << 1) | (dest[i + 32 + b] & 1);
+                    }
+                    if (w == w2) {
+                        decoded_block = w;
+                        has_decoded = true;
+                        break;
+                    }
+                }
+                if (i + 65 <= size) {
+                    uint32_t w3 = 0;
+                    for (int b = 0; b < 32; b++) {
+                        w3 = (w3 << 1) | (dest[i + 33 + b] & 1);
+                    }
+                    if (w == w3) {
+                        decoded_block = w;
+                        has_decoded = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
-        reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, NULL, 0);
+        if (has_decoded) {
+            reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, (uint8_t *)&decoded_block, sizeof(decoded_block));
+        } else {
+            reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, NULL, 0);
+        }
         if (ledcontrol) LED_A_OFF();
     }
 

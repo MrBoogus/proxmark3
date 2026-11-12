@@ -359,7 +359,39 @@ static bool cep_spi_read_byte(uint8_t *out) {
 // arrive, which is fine for receive_ng()'s own cadence but would add that
 // wait to every iteration of every LF/HF reader loop in the codebase.
 bool cep_spi_rx_pending(void) {
-    return spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) != RESET;
+    if (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) == RESET) {
+        return false;
+    }
+    // FAP's reply-poll clocks 0xFF dummy bytes on MOSI while waiting for a reply.
+    // Consume 0xFF filler so data_available() only triggers on a real command
+    // preamble (0x55 = CEP_SYNC_BYTE) or frame byte.
+    bool roerr = (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET);
+    uint8_t b = spi_i2s_data_receive(SPI1);
+    if (roerr) {
+        spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
+    }
+    s_last_spi_activity_tick = GetTickCount();
+    if (b != 0xFF) {
+        return true;
+    }
+    // If ROERR was set, SPI_DT was frozen with an old 0xFF from the start of a
+    // long blocking acquisition (e.g. LF DoAcquisition_default) and dropped all
+    // subsequent bytes. Now that ROERR is cleared, wait briefly (up to 25ms) to
+    // sample the live poll byte from the Flipper (0x55 if breaking, 0xFF if idle).
+    if (roerr) {
+        uint32_t t0 = GetTickCount();
+        while (GetTickCountDelta(t0) < 25) {
+            if (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) != RESET) {
+                b = spi_i2s_data_receive(SPI1);
+                if (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET) {
+                    spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
+                }
+                s_last_spi_activity_tick = GetTickCount();
+                return (b != 0xFF);
+            }
+        }
+    }
+    return false;
 }
 
 bool cep_spi_data_available(void) {
@@ -371,11 +403,17 @@ bool cep_spi_data_available(void) {
     }
     uint8_t len_header[2] = {0x00};
     size_t discarded = 0;
+    bool seen_sync = false;
     while (1) {
         if (!cep_spi_read_byte(&len_header[0])) {
             return false;
         }
-        if (len_header[0] != CEP_SYNC_BYTE) {
+        s_last_spi_activity_tick = GetTickCount();
+        if (len_header[0] == CEP_SYNC_BYTE) {
+            seen_sync = true;
+        } else if (!seen_sync && len_header[0] == 0xFF) {
+            // Discard 0xFF reply-poll filler bytes prior to a 0x55 sync preamble
+        } else {
             break;
         }
         if (++discarded > CEP_SYNC_MAX_DISCARD) {
@@ -488,8 +526,12 @@ cleanup:
     // Same full-duplex freeze as cep_spi_data_available() - SPI1 shifted a
     // byte in on MOSI for every byte clocked out above. Clear it here, once,
     // outside the timed write, so the read path never inherits it.
+    if (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) != RESET) {
+        (void)spi_i2s_data_receive(SPI1);
+    }
     if (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET) {
         spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
     }
+    s_last_spi_activity_tick = GetTickCount();
     return ret;
 }

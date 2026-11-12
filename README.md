@@ -1,5 +1,21 @@
 # Iceman Fork - Proxmark
 
+> [!IMPORTANT]
+> ### MrBoogus Personal Fork — Proxmark5 Enhancements Summary
+> This personal fork introduces critical stability and performance enhancements for the **Proxmark5 (AT32F437)** when operating with companion controllers (such as the Flipper Zero via CEP SPI) and standalone LF operations:
+> 
+> 1. **PM5 CEP SPI Overrun Recovery & Filler Drain ([pm5_cep.c](armsrc/pm5_cep.c))**:
+>    - **Problem**: Host controllers (such as the Flipper Zero FAP) clock `0xFF` filler bytes on MOSI while polling for execution results. During long blocking acquisitions (such as LF `DoAcquisition_default` running for ~3.5s), hardware `SPI1` asserted the `ROERR` (RX overrun) flag and froze `SPI_DT` at `0xFF`, dropping subsequent command bytes and causing continuous reader loops (`WatchEM410x`, `WatchHID`, `SniffIso14443a`) to prematurely abort.
+>    - **Fix**: `cep_spi_rx_pending()` now drains `0xFF` poll filler bytes, detects and clears `SPI_I2S_ROERR_FLAG`, and samples live poll bytes (allowing clean `0x55` break requests to be serviced). `cep_spi_data_available()` drains pre-sync `0xFF` padding before `0x55` sync bytes, and `cep_spi_write()` cleans `RDBF`/`ROERR` flags after outbound transfers.
+> 
+> 2. **Fast MCU-Side ASK Demodulation for T55xx ([lfops.c](armsrc/lfops.c))**:
+>    - **Problem**: Reading individual T55xx blocks previously required the host to initiate an expensive raw sample trace download (`CMD_DOWNLOAD_BIGBUF`) and perform host-side demodulation, introducing severe latency over constrained serial/SPI links.
+>    - **Fix**: When reading individual blocks (`brute_mem == false`), `T55xxReadBlock` runs `askdemod()` directly on raw samples in `BigBuf` on the AT32 MCU (288 MHz). If a valid repeating 32-bit block is verified across adjacent frames, the decoded `uint32_t` is returned directly in the `CMD_LF_T55XX_READBL` payload in milliseconds, with zero overhead and full backward compatibility.
+> 
+> *Upstream PR branch: `pm5-cep-improvements` (contains only code patches, excluding this README note).*
+
+---
+
 The Proxmark is the swiss-army tool of RFID, allowing for interactions with the vast majority of RFID tags on a global scale. Originally built by Jonathan Westhues, the device is now the goto tool for RFID Analysis for the enthusiast.
 
 Iceman repository is considered to be the pinnacle of features and functionality, enabling a huge range of extremely useful and convenient commands and Python/LUA scripts to automate chip identification, penetration testing, and programming.

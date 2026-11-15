@@ -44,7 +44,9 @@
 #define CEP_ATTACH_POLL_MS       50      // CC-controller I2C poll interval
 #define CEP_HANDSHAKE_STRING     "iamf0rupm5"
 #define CEP_HANDSHAKE_STX        0x02
-#define CEP_SPI_BYTE_TIMEOUT     100000  // spin-wait iterations per byte (matches source)
+#define CEP_SPI_BYTE_TIMEOUT     1000000 // spin-wait iterations per byte for slow HAL SPI TX gaps
+#define CEP_SPI_RX_BYTE_TIMEOUT  100000  // spin-wait iterations per byte for master-driven RX frames
+#define CEP_SPI_POLL_LOOKAHEAD   2000    // short lookahead (~150us) to drain 2-byte 0xFF polls / post-TX BF_FLAG clear
 // The Flipper master only clocks the bus in bursts roughly every ~120ms
 // (its own idle poll cadence) - CEP_SPI_BYTE_TIMEOUT alone (~3-10ms real
 // time) is far shorter than that gap, so the first reply byte - the one
@@ -71,6 +73,7 @@
 static bool s_cep_active = false;   // handshake completed, SPI transport live
 static bool s_cep_attached = false; // CC controller reports a physical attach
 static uint32_t s_last_spi_activity_tick = 0; // last time a real SPI poll was seen
+static bool s_cep_rx_break_latched = false; // non-0xFF MOSI byte observed during TX
 
 bool cep_is_active(void) {
     return s_cep_active;
@@ -203,6 +206,9 @@ void cep_init(void) {
     I2C_init(true);
 }
 
+// Forward declaration for SPI helper used during handshake drain/cleanup.
+static bool cep_spi_wait_tdbe(uint64_t timeout_limit);
+
 // ---------------------------------------------------------------------------
 // Handshake
 // ---------------------------------------------------------------------------
@@ -270,6 +276,17 @@ static bool cep_do_handshake(void) {
         spi_i2s_data_transmit(SPI1, response[i]);
     }
 
+    if (cep_spi_wait_tdbe(CEP_SPI_BYTE_TIMEOUT)) {
+        uint64_t timeout = 0;
+        while (spi_i2s_flag_get(SPI1, SPI_I2S_BF_FLAG) == SET) {
+            if (timeout++ > CEP_SPI_POLL_LOOKAHEAD) {
+                break;
+            }
+        }
+        SpinDelayUs(10);
+    }
+    cep_spi_resync();
+
     return true;
 }
 
@@ -279,6 +296,20 @@ static bool cep_do_handshake(void) {
 
 void cep_attach_poll(void) {
     static uint32_t last_tick = 0;
+
+    if (s_cep_active) {
+        if (usart_flag_get(USART1, USART_RDBF_FLAG) != RESET) {
+            s_cep_active = cep_do_handshake();
+            if (s_cep_active) {
+                s_last_spi_activity_tick = GetTickCount();
+            }
+            last_tick = GetTickCount();
+            return;
+        }
+        if (GetTickCountDelta(s_last_spi_activity_tick) < 500) {
+            return;
+        }
+    }
 
     if ((last_tick != 0) && (GetTickCountDelta(last_tick) < CEP_ATTACH_POLL_MS)) {
         return;
@@ -343,43 +374,103 @@ void cep_attach_poll(void) {
 static bool cep_spi_read_byte(uint8_t *out) {
     uint64_t timeout = 0;
     while (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) == RESET) {
-        if (timeout++ > CEP_SPI_BYTE_TIMEOUT) {
+        if (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET) {
+            spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
+        }
+        if (timeout++ > CEP_SPI_RX_BYTE_TIMEOUT) {
             return false;
         }
     }
     *out = spi_i2s_data_receive(SPI1);
-    return true;
-}
-
-// Genuinely non-blocking - a single flag read, no spin-wait at all. For
-// data_available()'s use (armsrc/util.c): a tight sampling loop calls that
-// every pass purely to notice an incoming CMD_BREAK_LOOP promptly, so it
-// needs to cost nothing when idle. cep_spi_data_available() isn't a fit
-// here - it waits (bounded, but non-zero) for a first byte to actually
-// arrive, which is fine for receive_ng()'s own cadence but would add that
-// wait to every iteration of every LF/HF reader loop in the codebase.
-bool cep_spi_rx_pending(void) {
-    return spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) != RESET;
-}
-
-bool cep_spi_data_available(void) {
-    // SPI1 is full-duplex, no RX FIFO: a byte can freeze in SPI_DT during
-    // any main-loop gap (write, I2C poll, WDT_HIT) until read (RM ch
-    // 13.2.9). Clear it before it's misread as part of a length header.
     if (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET) {
         spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
     }
+    return true;
+}
+
+// Drain the current byte in SPI_DT, clear any overrun, and refresh the
+// CEP activity timestamp so idle 0xFF poll bytes never look like host breaks.
+static uint8_t cep_spi_drain_byte(void) {
+    uint8_t b = spi_i2s_data_receive(SPI1);
+    if (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET) {
+        spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
+    }
+    s_last_spi_activity_tick = GetTickCount();
+    return b;
+}
+
+// Drain any byte already sitting in SPI_DT during TX and latch if the host
+// drove a non-0xFF break byte before cep_spi_resync() clears SPI1 state.
+static void cep_spi_drain_and_latch(void) {
+    if (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) != RESET) {
+        uint8_t b = cep_spi_drain_byte();
+        if (b != 0xFF && b != 0x00) {
+            s_cep_rx_break_latched = true;
+        }
+    }
+}
+
+// Non-blocking poll for data_available() (armsrc/util.c): a tight sampling
+// loop calls this every pass purely to notice an incoming CMD_BREAK_LOOP
+// promptly. Drains 0xFF filler and clears any sticky ROERR overrun in 0us
+// (never blocking time-critical SSC DMA loops) so subsequent 0x55 sync bytes
+// from the Flipper's break poll trigger on the very next pass.
+bool cep_spi_rx_pending(void) {
+    if (!s_cep_active) {
+        return false;
+    }
+    if (s_cep_rx_break_latched) {
+        s_cep_rx_break_latched = false;
+        return true;
+    }
+    if (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) == RESET) {
+        return false;
+    }
+    uint8_t b = cep_spi_drain_byte();
+    return (b != 0xFF && b != 0x00);
+}
+
+bool cep_spi_data_available(void) {
+    s_cep_rx_break_latched = false;
+    // Non-blocking fast path: if no byte has been shifted into SPI_DT,
+    // return immediately so AppMain() never stalls on an idle SPI bus.
+    if (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) == RESET) {
+        return false;
+    }
     uint8_t len_header[2] = {0x00};
     size_t discarded = 0;
+    bool seen_sync = false;
     while (1) {
+        if (!seen_sync) {
+            uint32_t wait = 0;
+            while (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) == RESET) {
+                if (wait++ > CEP_SPI_POLL_LOOKAHEAD) {
+                    return false;
+                }
+            }
+            len_header[0] = cep_spi_drain_byte();
+            if (len_header[0] == 0xFF || len_header[0] == 0x00) {
+                if (++discarded > CEP_SYNC_MAX_DISCARD) {
+                    return false;
+                }
+                continue;
+            }
+            if (len_header[0] == CEP_SYNC_BYTE) {
+                seen_sync = true;
+                discarded = 1;
+                continue;
+            }
+            break;
+        }
         if (!cep_spi_read_byte(&len_header[0])) {
             return false;
         }
+        s_last_spi_activity_tick = GetTickCount();
         if (len_header[0] != CEP_SYNC_BYTE) {
             break;
         }
         if (++discarded > CEP_SYNC_MAX_DISCARD) {
-            // More sync bytes than the FAP's real preamble (500) can only
+            // More sync bytes than the FAP's real preamble (580) can only
             // mean a desynced read (AT32 errata ES0003, see
             // cep_spi_resync()) or bus noise - resync now rather than
             // leaving SPI1 in that state until a later CRC/length check
@@ -410,14 +501,12 @@ bool cep_spi_data_available(void) {
 
 uint32_t cep_spi_read_ng(uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; ++i) {
-        uint64_t timeout = 0;
-        while (spi_i2s_flag_get(SPI1, SPI_I2S_RDBF_FLAG) == RESET) {
-            if (timeout++ > CEP_SPI_BYTE_TIMEOUT) {
-                return i;
-            }
+        if (!cep_spi_read_byte(&data[i])) {
+            s_cep_rx_break_latched = false;
+            return i;
         }
-        data[i] = spi_i2s_data_receive(SPI1);
     }
+    s_cep_rx_break_latched = false;
     return len;
 }
 
@@ -440,8 +529,13 @@ static bool cep_spi_wait_tdbe(uint64_t timeout_limit) {
 int cep_spi_write_sync(uint8_t *data, size_t len) {
     int ret = PM3_SUCCESS;
 
-    // These two length-header bytes are the ones racing against the
-    // master's next poll - see CEP_SPI_HEADER_BYTE_TIMEOUT's comment.
+    cep_spi_drain_and_latch();
+    if (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET) {
+        spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
+    }
+
+    // These two length-header bytes are preloaded into the shift register and
+    // SPI_DT; i == 0 below is the wait that blocks until the master's next poll.
     if (!cep_spi_wait_tdbe(CEP_SPI_HEADER_BYTE_TIMEOUT)) {
         ret = PM3_EIO;
         goto cleanup;
@@ -455,41 +549,39 @@ int cep_spi_write_sync(uint8_t *data, size_t len) {
     spi_i2s_data_transmit(SPI1, (len >> 8) & 0xFF);
 
     for (size_t i = 0; i < len; ++i) {
-        if (!cep_spi_wait_tdbe(CEP_SPI_BYTE_TIMEOUT)) {
+        // i == 0 waits for the master's 2-byte length-header poll (Transfer #1);
+        // i == 2 waits for the master's payload DMA (Transfer #2) after it logs
+        // "Data length to receive: %u" on its low-priority RX thread.
+        uint64_t limit = (i <= 2) ? CEP_SPI_HEADER_BYTE_TIMEOUT : CEP_SPI_BYTE_TIMEOUT;
+        if (!cep_spi_wait_tdbe(limit)) {
             ret = PM3_EIO;
             goto cleanup;
         }
         spi_i2s_data_transmit(SPI1, data[i]);
+        cep_spi_drain_and_latch();
     }
 
-    // Two trailing zero bytes: the agreed "no more data" idle marker.
+    // Wait until the last payload byte moves into the shift register, keep
+    // SPI_DT empty so BF_FLAG clears once the final bit finishes shifting out,
+    // and let the master release CS before resetting SPI1 in cleanup.
     if (!cep_spi_wait_tdbe(CEP_SPI_BYTE_TIMEOUT)) {
         ret = PM3_EIO;
         goto cleanup;
     }
-    spi_i2s_data_transmit(SPI1, 0x00);
-    if (!cep_spi_wait_tdbe(CEP_SPI_BYTE_TIMEOUT)) {
-        ret = PM3_EIO;
-        goto cleanup;
-    }
-    spi_i2s_data_transmit(SPI1, 0x00);
 
     {
         uint64_t timeout = 0;
         while (spi_i2s_flag_get(SPI1, SPI_I2S_BF_FLAG) == SET) {
-            if (timeout++ > CEP_SPI_BYTE_TIMEOUT) {
-                ret = PM3_EIO;
-                goto cleanup;
+            if (timeout++ > CEP_SPI_POLL_LOOKAHEAD) {
+                break;
             }
         }
     }
+    SpinDelayUs(10);
 
 cleanup:
-    // Same full-duplex freeze as cep_spi_data_available() - SPI1 shifted a
-    // byte in on MOSI for every byte clocked out above. Clear it here, once,
-    // outside the timed write, so the read path never inherits it.
-    if (spi_i2s_flag_get(SPI1, SPI_I2S_ROERR_FLAG) != RESET) {
-        spi_i2s_flag_clear(SPI1, SPI_I2S_ROERR_FLAG);
-    }
+    cep_spi_drain_and_latch();
+    cep_spi_resync();
+    s_last_spi_activity_tick = GetTickCount();
     return ret;
 }

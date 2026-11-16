@@ -1,5 +1,11 @@
 # Iceman Fork - Proxmark
 
+## About this fork
+
+- Tested on my own Proxmark5 (`AT32F437`, `BWM`) + Flipper Zero (`Momentum mntm-012`) + Proxmark3 Easy + T5577 card.
+- Includes CEP SPI reliability fixes (`armsrc/pm5_cep.c`) and on-device T55xx ASK block decoding (`armsrc/lfops.c`, tested at `RF/16`, `RF/32`, and `RF/64`). My companion Flipper app fork ([MrBoogus/Proxmark5_FlipperZero_FAP](https://github.com/MrBoogus/Proxmark5_FlipperZero_FAP)) needs this firmware for T5577 block reads.
+- Written with help from an AI coding assistant. Use it at your own risk, and anyone is welcome to take what they like.
+
 The Proxmark is the swiss-army tool of RFID, allowing for interactions with the vast majority of RFID tags on a global scale. Originally built by Jonathan Westhues, the device is now the goto tool for RFID Analysis for the enthusiast.
 
 Iceman repository is considered to be the pinnacle of features and functionality, enabling a huge range of extremely useful and convenient commands and Python/LUA scripts to automate chip identification, penetration testing, and programming.

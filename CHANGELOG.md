@@ -3,6 +3,7 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
+- Added MCU-side ASK/Manchester demodulation to `CMD_LF_T55XX_READBL` (`T55xxReadBlock`), returning the decoded 32-bit block in the reply payload for CEP/standalone hosts while keeping raw `BigBuf` samples intact (@MrBoogus)
 - Fixed PM5 CEP SPI - drain 0xFF poll filler and clear SPI1 RX overrun (`ROERR`) in `cep_spi_rx_pending()` / `cep_spi_data_available()` so continuous LF/HF reader, watch, and sniff loops do not abort prematurely over the Flipper Zero CEP link (@MrBoogus)
 - Fixed `hf iclass dump` - the emulator memory is kept, a dump no longer wipes what `hf iclass eload` loaded (@matrix)
 - Fixed `hf 14a raw --topaz` - the answer's CRC was checked as a CRC_A instead of the CRC_B Topaz uses, so a valid answer showed its CRC in red (@matrix)

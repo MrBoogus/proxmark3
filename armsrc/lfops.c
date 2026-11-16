@@ -1934,6 +1934,14 @@ void T55xxDangerousRawTest(const uint8_t *data, bool ledcontrol) {
     if (ledcontrol) LED_A_OFF();
 }
 
+// Cached sample-phase ASK anchor locked on Page 0 Block 0 so subsequent data
+// block reads (including degenerate all-0s/1s or 0xAAAAAAAA/0x55555555 patterns)
+// decode deterministically without bit/half-bit slippage.
+static bool s_t55_ask_valid = false;
+static int s_t55_ask_clk = 0;
+static int8_t s_t55_ask_pol = 1;
+static size_t s_t55_ask_anchor = 1536;
+
 // Write one card block in page 0, no lock
 //void T55xxWriteBlockExt(uint32_t data, uint8_t blockno, uint32_t pwd, uint8_t flags) {
 void T55xxWriteBlock(uint8_t *data, bool ledcontrol) {
@@ -1951,6 +1959,10 @@ void T55xxWriteBlock(uint8_t *data, bool ledcontrol) {
 
     t55xx_write_block_t *c = (t55xx_write_block_t *)data;
     // c->data, c->blockno, c->pwd, c->flags
+
+    if ((c->blockno & 0x07) == 0 && (c->flags & 0x02) == 0) {
+        s_t55_ask_valid = false;
+    }
 
     bool testMode = ((c->flags & 0x04) == 0x04);
 
@@ -2055,6 +2067,242 @@ bool brute_mem = (flags & 0x0100) >> 8;
     }
 }
 */
+static bool lfops_pack_u32_bits(const uint8_t *bits, uint32_t *out) {
+    uint32_t w = 0;
+    for (int b = 0; b < 32; b++) {
+        if (bits[b] > 1) {
+            return false;
+        }
+        w = (w << 1) | bits[b];
+    }
+    *out = w;
+    return true;
+}
+
+static bool lfops_t55xx_block0_ask_plausible(uint32_t block0, int clk) {
+    uint8_t safer = (block0 >> 28) & 0x0F;
+    uint8_t resv = (block0 >> 24) & 0x0F;
+    if (resv != 0) {
+        return false;
+    }
+    if (safer != 0x0 && safer != 0x6 && safer != 0x9) {
+        return false;
+    }
+    uint8_t extend = (block0 >> 17) & 0x01;
+    if (extend && safer != 0x6 && safer != 0x9) {
+        return false;
+    }
+    uint8_t modread = (block0 >> 12) & 0x1F;
+    if (modread != 8) {
+        return false;
+    }
+    if (!extend) {
+        static const uint8_t k_clks[8] = {8, 16, 32, 40, 50, 64, 100, 128};
+        uint8_t rate_idx = (block0 >> 18) & 0x07;
+        if ((int)k_clks[rate_idx] != clk) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool lfops_t55xx_match_repeat(const uint8_t *scratch, size_t size, size_t i, uint32_t *out) {
+    uint32_t w1 = 0, w2 = 0;
+    if (i + 64 > size || !lfops_pack_u32_bits(scratch + i, &w1)) {
+        return false;
+    }
+    if ((lfops_pack_u32_bits(scratch + i + 32, &w2) && w1 == w2) ||
+        (i + 65 <= size && lfops_pack_u32_bits(scratch + i + 33, &w2) && w1 == w2)) {
+        *out = w1;
+        return true;
+    }
+    return false;
+}
+
+static int32_t lfops_t55xx_anchor_score(const uint8_t *dest, size_t pos, int clk, uint32_t word) {
+    int q1 = clk >> 2;
+    int q2 = clk - q1;
+    int32_t score = 0;
+    for (int b = 0; b < 32; b++) {
+        size_t bstart = pos + (size_t)b * (size_t)clk;
+        int32_t d = (int32_t)dest[bstart + q1] - (int32_t)dest[bstart + q2];
+        score += ((word >> (31 - b)) & 1U) ? -d : d;
+    }
+    return score;
+}
+
+static uint32_t lfops_t55xx_energy_at(const uint8_t *dest, size_t pos, int clk) {
+    int q1 = clk >> 2;
+    int q2 = clk - q1;
+    uint32_t e = 0;
+    for (int b = 0; b < 32; b++) {
+        size_t bstart = pos + (size_t)b * (size_t)clk;
+        int32_t d = (int32_t)dest[bstart + q1] - (int32_t)dest[bstart + q2];
+        e += (uint32_t)(d < 0 ? -d : d);
+    }
+    return e;
+}
+
+static void lfops_t55xx_anchor_block0(const uint8_t *dest, size_t raw_size, int clk, uint32_t word) {
+    if ((word & T55x7_ST_TERMINATOR) != 0 || clk < 16 || clk > 128) {
+        s_t55_ask_valid = false;
+        return;
+    }
+    const size_t base = 1536;
+    size_t period = (size_t)(32 * clk);
+    if (base + period + (size_t)(32 * clk) > raw_size) {
+        s_t55_ask_valid = false;
+        return;
+    }
+
+    size_t best_pos = base;
+    int32_t best_raw = 0;
+    int32_t best_abs = -1;
+    for (size_t pos = base; pos < base + period; pos += 2) {
+        int32_t s = lfops_t55xx_anchor_score(dest, pos, clk, word);
+        int32_t a = (s < 0) ? -s : s;
+        if (a > best_abs) {
+            best_abs = a;
+            best_raw = s;
+            best_pos = pos;
+        }
+    }
+
+    size_t half_win = (size_t)(clk >> 1);
+    size_t scan_lo = (best_pos > base + half_win) ? (best_pos - half_win) : base;
+    size_t scan_hi = MIN(base + period - 1, best_pos + half_win);
+    for (size_t pos = scan_lo; pos <= scan_hi; pos++) {
+        int32_t s = lfops_t55xx_anchor_score(dest, pos, clk, word);
+        int32_t a = (s < 0) ? -s : s;
+        if (a > best_abs) {
+            best_abs = a;
+            best_raw = s;
+            best_pos = pos;
+        }
+    }
+
+    if (best_abs <= 0) {
+        s_t55_ask_valid = false;
+        return;
+    }
+
+    int32_t thresh = best_abs - (best_abs >> 4);
+    size_t first_pos = best_pos;
+    size_t last_pos = best_pos;
+    for (size_t pos = scan_lo; pos <= scan_hi; pos++) {
+        int32_t s = lfops_t55xx_anchor_score(dest, pos, clk, word);
+        int32_t a = (s < 0) ? -s : s;
+        if (a >= thresh) {
+            first_pos = pos;
+            break;
+        }
+    }
+    for (size_t pos = scan_hi; pos >= scan_lo; pos--) {
+        int32_t s = lfops_t55xx_anchor_score(dest, pos, clk, word);
+        int32_t a = (s < 0) ? -s : s;
+        if (a >= thresh) {
+            last_pos = pos;
+            break;
+        }
+        if (pos == 0) {
+            break;
+        }
+    }
+
+    s_t55_ask_anchor = (first_pos + last_pos) >> 1;
+    while (s_t55_ask_anchor >= 256 + period &&
+           s_t55_ask_anchor + (size_t)(64 * clk) > raw_size) {
+        s_t55_ask_anchor -= period;
+    }
+    s_t55_ask_pol = (best_raw >= 0) ? 1 : -1;
+    s_t55_ask_clk = clk;
+    s_t55_ask_valid = true;
+}
+
+static bool lfops_t55xx_decode_anchored(const uint8_t *dest, size_t raw_size, uint32_t *out) {
+    if (!s_t55_ask_valid || s_t55_ask_clk < 16 || s_t55_ask_clk > 128) {
+        return false;
+    }
+    int clk = s_t55_ask_clk;
+    int half = clk >> 1;
+    int limit = (clk >> 2) - 1;
+    if (limit < 1 || s_t55_ask_anchor < (size_t)limit ||
+        s_t55_ask_anchor + (size_t)(64 * clk) + (size_t)limit > raw_size) {
+        return false;
+    }
+
+    uint8_t min_v = 255, max_v = 0;
+    size_t span_lo = s_t55_ask_anchor - (size_t)limit;
+    size_t span_hi = s_t55_ask_anchor + (size_t)(64 * clk) + (size_t)limit;
+    for (size_t i = span_lo; i < span_hi; i++) {
+        uint8_t v = dest[i];
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+    }
+    if ((int)(max_v - min_v) < 24) {
+        return false;
+    }
+
+    uint32_t best_e = 0;
+    size_t best_pos = s_t55_ask_anchor;
+    for (int d = -limit; d <= limit; d++) {
+        size_t pos = (size_t)((int32_t)s_t55_ask_anchor + d);
+        uint32_t e = lfops_t55xx_energy_at(dest, pos, clk);
+        if (e > best_e) {
+            best_e = e;
+            best_pos = pos;
+        }
+    }
+    if (best_e == 0) {
+        return false;
+    }
+
+    uint32_t thresh_e = best_e - (best_e >> 4);
+    size_t first_pos = best_pos;
+    size_t last_pos = best_pos;
+    for (int d = -limit; d <= limit; d++) {
+        size_t pos = (size_t)((int32_t)s_t55_ask_anchor + d);
+        if (lfops_t55xx_energy_at(dest, pos, clk) >= thresh_e) {
+            first_pos = pos;
+            break;
+        }
+    }
+    for (int d = limit; d >= -limit; d--) {
+        size_t pos = (size_t)((int32_t)s_t55_ask_anchor + d);
+        if (lfops_t55xx_energy_at(dest, pos, clk) >= thresh_e) {
+            last_pos = pos;
+            break;
+        }
+    }
+    size_t anchored_pos = (first_pos + last_pos) >> 1;
+
+    int32_t min_half_diff = ((int32_t)(max_v - min_v) * half) / 6;
+    uint32_t w[2] = {0, 0};
+    int strong_bits = 0;
+    for (int rep = 0; rep < 2; rep++) {
+        for (int b = 0; b < 32; b++) {
+            size_t bstart = anchored_pos + (size_t)(rep * 32 + b) * (size_t)clk;
+            int32_t sum1 = 0, sum2 = 0;
+            for (int k = 0; k < half; k++) {
+                sum1 += dest[bstart + (size_t)k];
+                sum2 += dest[bstart + (size_t)(half + k)];
+            }
+            int32_t diff = (sum1 - sum2) * (int32_t)s_t55_ask_pol;
+            int32_t abs_diff = (diff < 0) ? -diff : diff;
+            if (abs_diff >= min_half_diff) {
+                strong_bits++;
+            }
+            w[rep] = (w[rep] << 1) | ((diff < 0) ? 1U : 0U);
+        }
+    }
+
+    if (strong_bits < 60 || w[0] != w[1]) {
+        return false;
+    }
+    *out = w[0];
+    return true;
+}
+
 // Read one card block in page [page]
 void T55xxReadBlock(uint8_t page, bool pwd_mode, bool brute_mem, uint8_t block, uint32_t pwd, uint8_t downlink_mode, bool ledcontrol) {
     /*
@@ -2114,8 +2362,53 @@ void T55xxReadBlock(uint8_t page, bool pwd_mode, bool brute_mem, uint8_t block, 
 
     // Turn the field off
     if (brute_mem == false) {
+        uint32_t decoded_block = 0;
+        bool has_decoded = false;
+        size_t raw_size = MIN((size_t)getSampleCounter(), samples);
+        uint8_t *dest = BigBuf_get_addr();
+        if (page == 0 && block == 0) {
+            bool bl0_found = false;
+            if (raw_size >= 64 && BigBuf_get_hi() >= raw_size * 2) {
+                // Demodulate on a scratch slice so BigBuf[0..raw_size-1] keeps raw samples for getSamples().
+                uint8_t *scratch = dest + raw_size;
+                size_t size = raw_size;
+                memcpy(scratch, dest, size);
+                int clk = 0, invert = 0, maxErr = 20;
+                int errCnt = askdemod(scratch, &size, &clk, &invert, maxErr, 0, 1);
+                if (errCnt >= 0 && errCnt <= 50 && size >= 64) {
+                    const size_t split = (size >= 96) ? 28 : 1;
+                    const size_t ranges[2][2] = {
+                        {split, size - 64},
+                        {1, (split > 1 && size >= 65) ? MIN(split - 1, size - 64) : 0},
+                    };
+                    for (size_t p = 0; p < ARRAYLEN(ranges) && !bl0_found; p++) {
+                        for (size_t i = ranges[p][0]; i <= ranges[p][1]; i++) {
+                            uint32_t w = 0;
+                            if (lfops_t55xx_match_repeat(scratch, size, i, &w) &&
+                                lfops_t55xx_block0_ask_plausible(w, clk)) {
+                                decoded_block = w;
+                                has_decoded = true;
+                                bl0_found = true;
+                                lfops_t55xx_anchor_block0(dest, raw_size, clk, w);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!bl0_found) {
+                s_t55_ask_valid = false;
+            }
+        } else if (raw_size >= 64) {
+            has_decoded = lfops_t55xx_decode_anchored(dest, raw_size, &decoded_block);
+        }
+
         FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
-        reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, NULL, 0);
+        if (has_decoded) {
+            reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, (uint8_t *)&decoded_block, sizeof(decoded_block));
+        } else {
+            reply_ng(CMD_LF_T55XX_READBL, PM3_SUCCESS, NULL, 0);
+        }
         if (ledcontrol) LED_A_OFF();
     }
 
